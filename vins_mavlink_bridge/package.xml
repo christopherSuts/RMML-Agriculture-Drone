@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>vins_mavlink_bridge</name>
+  <version>0.0.1</version>
+  <description>Send VINS odometry to CubeOrange via MAVLink</description>
+
+  <maintainer email="chrissutandar@gmail.com">Christopher</maintainer>
+  <license>MIT</license>
+
+  <!-- PYTHON package: use ament_python, NOT ament_cmake -->
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+
+  <!-- pymavlink provided via pip; not a ROS dep -->
+</package>
