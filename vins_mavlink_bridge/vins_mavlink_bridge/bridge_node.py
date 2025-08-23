@@ -1,159 +1,120 @@
+#!/usr/bin/env python3
+import math
 import time
-import numpy as np
+from typing import Optional
+
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile
 from nav_msgs.msg import Odometry
 
-# pymavlink
 from pymavlink import mavutil
-from pymavlink.dialects.v20 import ardupilotmega as mavlink2
 
-def rotmat_from_quat(q):  # [x,y,z,w] -> 3x3
-    x,y,z,w = q
-    xx, yy, zz = x*x, y*y, z*z
-    xy, xz, yz = x*y, x*z, y*z
-    wx, wy, wz = w*x, w*y, w*z
-    return np.array([
-        [1 - 2*(yy+zz), 2*(xy - wz),   2*(xz + wy)],
-        [2*(xy + wz),   1 - 2*(xx+zz), 2*(yz - wx)],
-        [2*(xz - wy),   2*(yz + wx),   1 - 2*(xx+yy)],
-    ])
 
-def quat_from_rotmat(R):
-    # Robust conversion (numerically stable)
-    m00,m01,m02 = R[0]; m10,m11,m12 = R[1]; m20,m21,m22 = R[2]
-    tr = m00 + m11 + m22
-    if tr > 0:
-        S = np.sqrt(tr+1.0)*2
-        w = 0.25*S
-        x = (m21 - m12) / S
-        y = (m02 - m20) / S
-        z = (m10 - m01) / S
-    elif (m00 > m11) and (m00 > m22):
-        S = np.sqrt(1.0 + m00 - m11 - m22)*2
-        w = (m21 - m12) / S
-        x = 0.25*S
-        y = (m01 + m10) / S
-        z = (m02 + m20) / S
-    elif m11 > m22:
-        S = np.sqrt(1.0 + m11 - m00 - m22)*2
-        w = (m02 - m20) / S
-        x = (m01 + m10) / S
-        y = 0.25*S
-        z = (m12 + m21) / S
-    else:
-        S = np.sqrt(1.0 + m22 - m00 - m11)*2
-        w = (m10 - m01) / S
-        x = (m02 + m20) / S
-        y = (m12 + m21) / S
-        z = 0.25*S
-    return np.array([x,y,z,w])
+def enu_to_ned_pos(x, y, z):
+    # ENU (E,N,U) -> NED (N,E,D)
+    return y, x, -z
+
 
 class VinsMavlinkBridge(Node):
     def __init__(self):
         super().__init__('vins_mavlink_bridge')
 
-        # Params
-        self.declare_parameter('odom_topic', '/vins/odometry')
-        self.declare_parameter('serial_path', '/dev/serial/by-id/REPLACE_ME')
+        # ---- Parameters
+        self.declare_parameter('odom_topic', '/odometry')
+        self.declare_parameter('serial_path', '/dev/ttyACM0')
         self.declare_parameter('baudrate', 115200)
         self.declare_parameter('rate_hz', 30)
 
-        self.odom_topic = self.get_parameter('odom_topic').get_parameter_value().string_value
-        self.serial_path = self.get_parameter('serial_path').get_parameter_value().string_value
-        self.baud = self.get_parameter('baudrate').get_parameter_value().integer_value
-        self.rate_hz = self.get_parameter('rate_hz').get_parameter_value().integer_value
+        self.odom_topic: str = self.get_parameter('odom_topic').get_parameter_value().string_value
+        self.serial_path: str = self.get_parameter('serial_path').get_parameter_value().string_value
+        self.baudrate: int = self.get_parameter('baudrate').get_parameter_value().integer_value
+        self.rate_hz: int = self.get_parameter('rate_hz').get_parameter_value().integer_value
 
-        # MAVLink connection
-        self.get_logger().info(f'Connecting MAVLink: {self.serial_path} @ {self.baud}')
-        self.mav = mavutil.mavlink_connection(
-            f'serial:{self.serial_path}',
-            baud=self.baud, autoreconnect=True, dialect='ardupilotmega'
+        # ---- Open MAVLink (serial by default)
+        device = self.serial_path
+        # Force serial backend if you passed a plain /dev/ path
+        if device.startswith('/dev/'):
+            device = f'serial:{device}'
+
+        self.get_logger().info(
+            f'Connecting MAVLink (serial): {self.serial_path} @ {self.baudrate}'
         )
-        self.mav.wait_heartbeat(timeout=10)
-        self.get_logger().info(f'Heartbeat OK: sysid={self.mav.target_system} compid={self.mav.target_component}')
+        self.mav = mavutil.mavserial(
+            device=self.serial_path,   # e.g. /dev/serial/by-id/usb-Hex_ProfiCNC_CubeOrange_...-if00
+            baud=self.baudrate,
+            source_system=1,
+            source_component=191,
+            autoreconnect=True
+        )
 
-        # ENU->NED rotation
-        self.R_ENU_to_NED = np.array([[0,1,0],
-                                      [1,0,0],
-                                      [0,0,-1]], dtype=float)
+        # Optional: wait briefly for heartbeat (don’t block forever)
+        try:
+            self.mav.wait_heartbeat(timeout=3)
+            self.get_logger().info('MAVLink heartbeat received.')
+        except Exception:
+            self.get_logger().warn('No heartbeat yet; continuing...')
 
-        # Subscriber
-        self.sub = self.create_subscription(Odometry, self.odom_topic, self.odom_cb, 10)
+        # ---- ROS subscriber
+        qos = QoSProfile(depth=10)
+        self.sub = self.create_subscription(Odometry, self.odom_topic, self.odom_cb, qos)
 
-        # Rate limiter
-        self.last_send = 0.0
-        self.period = 1.0 / max(1, self.rate_hz)
-
-    def enu_to_ned_vec(self, v):
-        return self.R_ENU_to_NED @ v
-
-    def enu_to_ned_quat(self, q_xyzw):
-        R_enu = rotmat_from_quat(q_xyzw)
-        R_ned = self.R_ENU_to_NED @ R_enu @ self.R_ENU_to_NED.T
-        return quat_from_rotmat(R_ned)
+        # Rate limiting
+        self._last_send = 0.0
+        self._min_dt = 1.0 / max(1, self.rate_hz)
 
     def odom_cb(self, msg: Odometry):
         now = time.time()
-        if (now - self.last_send) < self.period:
+        if now - self._last_send < self._min_dt:
             return
-        self.last_send = now
+        self._last_send = now
 
-        # Position (m)
-        p_enu = np.array([msg.pose.pose.position.x,
-                          msg.pose.pose.position.y,
-                          msg.pose.pose.position.z], dtype=float)
-        p_ned = self.enu_to_ned_vec(p_enu)
+        # ENU -> NED quick position conversion
+        x_e, y_e, z_u = msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z
+        x_n, y_east, z_d = y_e, x_e, -z_u  # N, E, D
 
-        # Orientation (quaternion xyzw)
-        q_enu = np.array([msg.pose.pose.orientation.x,
-                          msg.pose.pose.orientation.y,
-                          msg.pose.pose.orientation.z,
-                          msg.pose.pose.orientation.w], dtype=float)
-        q_ned = self.enu_to_ned_quat(q_enu)
+        # TODO: replace with real ENU->NED quaternion conversion
+        q = [1.0, 0.0, 0.0, 0.0]  # [w, x, y, z]
 
-        # Velocity (m/s)
-        v_enu = np.array([msg.twist.twist.linear.x,
-                          msg.twist.twist.linear.y,
-                          msg.twist.twist.linear.z], dtype=float)
-        v_ned = self.enu_to_ned_vec(v_enu)
+        vx = vy = vz = 0.0
+        rollspeed = pitchspeed = yawspeed = 0.0
 
-        # Angular rates: ENU -> NED (for small rates, same transform of vector)
-        w_enu = np.array([msg.twist.twist.angular.x,
-                          msg.twist.twist.angular.y,
-                          msg.twist.twist.angular.z], dtype=float)
-        w_ned = self.enu_to_ned_vec(w_enu)
+        # MAVLink expects 21-length cov arrays; NaNs mean "unknown"
+        nan21 = [float('nan')] * 21
 
-        # Time (microseconds, UNIX)
-        usec = int(now * 1e6)
+        # Timestamp in microseconds
+        stamp_us = self.get_clock().now().nanoseconds // 1000
 
-        # Frame enums (MAV_FRAME)
-        frame_id     = mavlink2.MAV_FRAME_LOCAL_NED          # 1
-        child_frame  = mavlink2.MAV_FRAME_BODY_FRD           # 12 (forward-right-down body)
+        try:
+            self.mav.mav.odometry_send(
+                stamp_us,
+                1,      # frame_id: MAV_FRAME_LOCAL_NED = 1
+                12,     # child_frame_id: MAV_FRAME_BODY_FRD = 12 (body Forward-Right-Down)
+                x_n, y_east, z_d,
+                q,      # quaternion [w, x, y, z]
+                vx, vy, vz,
+                rollspeed, pitchspeed, yawspeed,
+                nan21,  # pose_covariance (len=21)
+                nan21,  # velocity_covariance (len=21)
+                0,      # reset_counter
+                3       # estimator_type: 3 = VISION
+            )
+        except Exception as e:
+            self.get_logger().warn(f"ODOMETRY send failed: {e}")
 
-        # Covariances (optional, put -1 for unknown)
-        cov_pose = [ -1.0 ] * 21
-        cov_vel  = [ -1.0 ] * 21
-
-        # Send MAVLink ODOMETRY
-        self.mav.mav.odometry_send(
-            usec,
-            frame_id,
-            child_frame,
-            p_ned[0], p_ned[1], p_ned[2],
-            q_ned[0], q_ned[1], q_ned[2], q_ned[3],
-            v_ned[0], v_ned[1], v_ned[2],
-            w_ned[0], w_ned[1], w_ned[2],
-            cov_pose, cov_vel,
-            mavlink2.MAV_ESTIMATOR_TYPE_VISION
-        )
 
 def main():
     rclpy.init()
     node = VinsMavlinkBridge()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
+
